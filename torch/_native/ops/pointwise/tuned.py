@@ -63,8 +63,21 @@ def _is_wrapped_scalar(t: torch.Tensor) -> bool:
     return isinstance(t, torch.Tensor) and t.dim() == 0 and t.device.type == "cpu"
 
 
-def _tensor_inputs(inputs: Sequence[torch.Tensor]) -> list[torch.Tensor]:
-    return [t for t in inputs if not _is_wrapped_scalar(t)]
+def _tensor_inputs(
+    inputs: Sequence[torch.Tensor], device_mask: tuple[bool, ...] | None = None
+) -> list[torch.Tensor]:
+    device_mask = device_mask or (False,) * len(inputs)
+    return [
+        t
+        for t, is_device in zip(inputs, device_mask)
+        if not is_device and not _is_wrapped_scalar(t)
+    ]
+
+
+def _device_scalars(
+    inputs: Sequence[torch.Tensor], device_mask: tuple[bool, ...] | None
+) -> list[torch.Tensor]:
+    return [t for t, is_device in zip(inputs, device_mask or ()) if is_device]
 
 
 def _scalar_mask(inputs: Sequence[torch.Tensor]) -> tuple[bool, ...]:
@@ -317,10 +330,13 @@ def can_run(
     out_dtype: torch.dtype,
     target: torch.Tensor | None = None,
     allow_tma: bool = True,
+    device_mask: tuple[bool, ...] | None = None,
 ) -> bool:
+    # device_mask marks one-element CUDA operands read through a pointer; only the vector
+    # kernel takes them.
     if not _ENABLED or not inputs:
         return False
-    tensors = _tensor_inputs(inputs)
+    tensors = _tensor_inputs(inputs, device_mask)
     if not tensors or out_dtype not in (*_DTYPES, torch.bool):
         return False
     ref = tensors[0]
@@ -360,6 +376,7 @@ def can_run(
             ):
                 return False
     address = 0 if target is None else _pointer(target)
+    allow_tma = allow_tma and device_mask is None
     return (
         _select_config(tensors, tuple(shape), address, out_dtype, allow_tma) is not None
     )
@@ -372,12 +389,13 @@ def try_run(
     out: torch.Tensor,
     consts: Sequence[Any],
     compute: Any,
+    device_mask: tuple[bool, ...] | None = None,
 ) -> bool:
     if len(consts) > _CONST_SLOTS or sum(_scalar_mask(inputs)) > _SCALAR_SLOTS:
         return False
-    if not can_run(inputs, out.shape, out.dtype, out):
+    if not can_run(inputs, out.shape, out.dtype, out, device_mask=device_mask):
         return False
-    run(fn, key, inputs, out, consts, compute)
+    run(fn, key, inputs, out, consts, compute, device_mask)
     return True
 
 
@@ -401,6 +419,8 @@ def _input_indices(
 
 
 class _ElementwiseVector:
+    # Device scalars (device_mask) trail mIns as (1,) tensors after the ninputs vector
+    # operands; each thread loads them once, before its loop.
     def __init__(
         self,
         fn: Any,
@@ -409,12 +429,21 @@ class _ElementwiseVector:
         compute: Any,
         out_type: Any,
         config: _VectorConfig,
+        device_mask: tuple[bool, ...] | None = None,
     ) -> None:
         self.fn = fn
         self.scalar_mask = scalar_mask
-        self.tensor_indices, self.scalar_indices = _input_indices(scalar_mask)
+        self.device_mask = device_mask or (False,) * len(scalar_mask)
+        operand_mask = tuple(
+            is_scalar or is_device
+            for is_scalar, is_device in zip(scalar_mask, self.device_mask)
+        )
+        self.tensor_indices, _ = _input_indices(operand_mask)
+        _, self.scalar_indices = _input_indices(scalar_mask)
+        _, self.device_indices = _input_indices(self.device_mask)
         self.nargs = len(scalar_mask)
-        self.ninputs = len(scalar_mask) - sum(scalar_mask)
+        self.ninputs = len(scalar_mask) - sum(operand_mask)
+        self.ndevice = sum(self.device_mask)
         self.nconsts = nconsts
         self.compute = compute
         self.out_type = out_type
@@ -468,6 +497,10 @@ class _ElementwiseVector:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         scalar_ins = (scalar0, scalar1, scalar2)
+        device_ins = [
+            self.compute(mIns[self.ninputs + d][0])
+            for d in range(const_expr(self.ndevice))
+        ]
         base = self.index_type(bidx) * const_expr(_BLOCK_THREADS * self.ept) + tidx
         for p in cutlass.range_constexpr(self.ept):
             index = base + p * _BLOCK_THREADS
@@ -483,6 +516,8 @@ class _ElementwiseVector:
                     for arg in cutlass.range_constexpr(self.nargs):
                         if const_expr(self.scalar_mask[arg]):
                             values.append(scalar_ins[self.scalar_indices[arg]])
+                        elif const_expr(self.device_mask[arg]):
+                            values.append(device_ins[self.device_indices[arg]])
                         else:
                             values.append(
                                 self.compute(regs[self.tensor_indices[arg]][e])
@@ -720,10 +755,14 @@ def _compile_plan(
     scalar_mask: tuple[bool, ...],
     consts: Sequence[Any],
     compute: Any,
+    device_mask: tuple[bool, ...] | None = None,
 ) -> _Plan:
-    tensors = _tensor_inputs(inputs)
+    tensors = _tensor_inputs(inputs, device_mask)
+    device = _device_scalars(inputs, device_mask)
     shape = tuple(tensors[0].shape)
-    config = _select_config(tensors, shape, _pointer(out), out.dtype)
+    config = _select_config(
+        tensors, shape, _pointer(out), out.dtype, allow_tma=device_mask is None
+    )
     if config is None:
         raise AssertionError("pointwise override selected an unsupported launch")
     in_type = torch2cute[tensors[0].dtype]
@@ -733,7 +772,9 @@ def _compile_plan(
     scalar_seeds = [compute(1)] * _SCALAR_SLOTS
     const_seeds = [compute(1)] * _CONST_SLOTS
     if isinstance(config, _VectorConfig):
-        op = _ElementwiseVector(fn, scalar_mask, len(consts), compute, out_type, config)
+        op = _ElementwiseVector(
+            fn, scalar_mask, len(consts), compute, out_type, config, device_mask
+        )
         fakes = [
             _L.fake_compact(
                 in_type,
@@ -742,6 +783,12 @@ def _compile_plan(
                 align=config.vec * tensors[0].element_size(),
             )
             for _ in tensors
+        ]
+        fakes += [
+            _L.fake_compact(
+                torch2cute[t.dtype], (1,), stride_order=(0,), align=t.element_size()
+            )
+            for t in device
         ]
         fake_out = _L.fake_compact(
             out_type,
@@ -774,6 +821,8 @@ def _compile_plan(
         tensors[0].device.index,
         caps.cc,
         caps.smem_per_block_optin,
+        device_mask,
+        tuple(t.dtype for t in device),
     )
     compiled = cached_plan(
         _KERNELS,
@@ -793,9 +842,11 @@ def run(
     out: torch.Tensor,
     consts: Sequence[Any],
     compute: Any,
+    device_mask: tuple[bool, ...] | None = None,
 ) -> None:
     scalar_mask = _scalar_mask(inputs)
-    tensors = _tensor_inputs(inputs)
+    tensors = _tensor_inputs(inputs, device_mask)
+    device = _device_scalars(inputs, device_mask)
     caps = _hw.caps(tensors[0].device)
     plan_key = (
         key[0],
@@ -811,11 +862,15 @@ def run(
         caps.smem_per_block_optin,
         tuple(_pointer(t) % 128 for t in tensors),
         _pointer(out) % 128,
+        device_mask,
+        tuple(t.dtype for t in device),
     )
     plan = cached_plan(
         _PLAN,
         plan_key,
-        lambda: _compile_plan(fn, key, inputs, out, scalar_mask, consts, compute),
+        lambda: _compile_plan(
+            fn, key, inputs, out, scalar_mask, consts, compute, device_mask
+        ),
     )
     scalar_inputs = [
         compute(t.item()) for t, is_scalar in zip(inputs, scalar_mask) if is_scalar
@@ -827,6 +882,7 @@ def run(
     if plan.config.path == "vector":
         vec = plan.config.vec
         runtime_inputs = [_L.read_only(t.reshape(-1, vec)) for t in tensors]
+        runtime_inputs += [_L.read_only(t.reshape(1)) for t in device]
         runtime_out = output.reshape(-1, vec)
     else:
         runtime_inputs = [

@@ -48,6 +48,10 @@ _ARCH_MAJORS = (9, 10)
 
 _SUPPORTED = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 
+# Rows whose one-element CUDA operand (e.g. a gradient scale computed on device) is read
+# once per thread on the vectorized routes instead of being broadcast per element.
+_DEVICE_SCALAR_ROWS = frozenset({"mul.Tensor"})
+
 
 def _layout_ok(t) -> bool:
     # Accept contiguous OR row-dense-gapped inputs. Contiguous -> the flat vec (or
@@ -394,6 +398,7 @@ def _make_impl(row: PointwiseDef, variant):
             ins,
             out_dtypes,
             out=targets,
+            device_scalars=row.aten in _DEVICE_SCALAR_ROWS,
         )
 
     def _targets(args, kwargs, ins, in_dtypes, promotion=None):

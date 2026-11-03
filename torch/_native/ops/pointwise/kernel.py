@@ -109,6 +109,30 @@ class _ScalarOperands:
         return self.fn(*values, *args[self.ninputs + self.nscalars :])
 
 
+def _scalar_operands(fn: Any, scalar_mask: tuple[bool, ...]) -> Any:
+    key = (id(fn), scalar_mask)
+    scalar_fn = _SCALAR_FUNCTIONS.get(key)
+    if scalar_fn is None:
+        scalar_fn = _SCALAR_FUNCTIONS[key] = _ScalarOperands(fn, scalar_mask)
+    return scalar_fn
+
+
+def _device_scalar_mask(inputs, out=None) -> tuple[bool, ...] | None:
+    # One-element CUDA operands that a vectorized kernel can read once per thread instead of
+    # broadcasting per element. Declines when every operand is one element, when a CPU scalar
+    # is also present, or when the kernel writes the scalar (other blocks would read a stored
+    # value).
+    mask = tuple(t.device.type == "cuda" and t.numel() == 1 for t in inputs)
+    if not any(mask) or all(mask):
+        return None
+    if any(t.device.type == "cpu" and t.dim() == 0 for t in inputs):
+        return None
+    scalars = [t for t, is_scalar in zip(inputs, mask) if is_scalar]
+    if out is not None and any(torch._C._overlaps(o, t) for o in out for t in scalars):
+        return None
+    return mask
+
+
 class _PointwiseConfig(NamedTuple):
     # The full pointwise knob set (specific to this kernel family: the reduction kernels
     # have their own, differently-shaped knobs -- block_x/grid_y/tpr/subrow_target/...).
@@ -174,6 +198,11 @@ class _ElementwiseVec:
     # not baked constants: one compiled kernel serves every scalar value (measured
     # free -- the scalar broadcast rides the same registers). nconsts (the arity) is
     # compile-time; the values are not.
+    #
+    # Device scalars (one-element CUDA operands, e.g. an on-device grad scale) trail
+    # mIns as (1,) tensors. Each thread loads them once, before its ept loop, and `fn`
+    # (wrapped in _ScalarOperands) receives them after the vector operands. The value is
+    # read at run time, so a captured CUDA graph sees later updates to it.
     def __init__(
         self,
         fn,
@@ -189,6 +218,7 @@ class _ElementwiseVec:
         pipe_depth,
         in_dtype,
         index_type=cutlass.Int32,
+        ndevice=0,
     ):
         self.fn = fn
         self.nin = nin
@@ -201,6 +231,7 @@ class _ElementwiseVec:
         self.ept = ept
         self.load = load
         self.pipe_depth = pipe_depth
+        self.ndevice = ndevice
         # Input element dtype (a concrete Numeric class). Needed for the tma/cpasync
         # smem allocations: under TMA mIns[k].element_type is a descriptor union, not
         # a plain Numeric, so we can't read it off the wrapped tensor there.
@@ -231,7 +262,7 @@ class _ElementwiseVec:
                 )
                 tma_atoms.append(atom)
                 tviews.append(v)
-            ins = tviews
+            ins = tviews + [mIns[self.nin + d] for d in range(const_expr(self.ndevice))]
         self.kernel(ins, mOuts, consts, nvec, tma_atoms).launch(
             grid=[cute.ceil_div(nvec, tile), 1, 1],
             block=[self.block, 1, 1],
@@ -239,14 +270,15 @@ class _ElementwiseVec:
         )
 
     @cute.jit
-    def _compute_store(self, regs, mOuts, consts, i):
+    def _compute_store(self, regs, mOuts, consts, i, device):
         # Shared fn + per-element compute + cast + vector store for one V-row `i`.
-        # regs: list[nin] of (V,) register fragments (the loaded inputs).
+        # regs: list[nin] of (V,) register fragments (the loaded inputs); device: the
+        # per-thread device-scalar values.
         V = const_expr(self.V)
         outs = [cute.make_rmem_tensor_like(mOuts[j][i, None]) for j in range(self.nout)]
         for e in cutlass.range_constexpr(V):
             vals = tuple(self.compute(regs[k][e]) for k in range(const_expr(self.nin)))
-            res = self.fn(*vals, *consts)
+            res = self.fn(*vals, *device, *consts)
             if const_expr(self.nout == 1):
                 outs[0][e] = self.out_types[0](res)
             else:
@@ -261,6 +293,9 @@ class _ElementwiseVec:
         bidx, _, _ = cute.arch.block_idx()
         block = const_expr(self.block)
         base = self.index_type(bidx) * const_expr(block * self.ept) + tidx
+        device = [
+            self.compute(mIns[self.nin + d][0]) for d in range(const_expr(self.ndevice))
+        ]
         if const_expr(self.load == "direct"):
             # gmem->rmem inline, per-thread block-strided ept-unrolled loop.
             for p in cutlass.range_constexpr(self.ept):
@@ -271,14 +306,14 @@ class _ElementwiseVec:
                         r = cute.make_rmem_tensor_like(mIns[k][i, None])
                         cute.autovec_copy(mIns[k][i, None], r)
                         regs.append(r)
-                    self._compute_store(regs, mOuts, consts, i)
+                    self._compute_store(regs, mOuts, consts, i, device)
         elif const_expr(self.load == "cpasync"):
-            self._kernel_cpasync(mIns, mOuts, consts, nvec, base, block)
+            self._kernel_cpasync(mIns, mOuts, consts, nvec, base, block, device)
         else:  # "tma"
-            self._kernel_tma(mIns, mOuts, consts, nvec, tma_atoms, base, block)
+            self._kernel_tma(mIns, mOuts, consts, nvec, tma_atoms, base, block, device)
 
     @cute.jit
-    def _kernel_cpasync(self, mIns, mOuts, consts, nvec, base, block):
+    def _kernel_cpasync(self, mIns, mOuts, consts, nvec, base, block, device):
         # cp.async gmem->smem ring, pipe_depth deep. Segment p's V-row for each input
         # is staged into sBuf[input][p % D]; the next segment's async copy overlaps
         # this segment's compute. Uses cpasync.CopyG2SOp + commit/wait_group only.
@@ -325,7 +360,7 @@ class _ElementwiseVec:
                     r = cute.make_rmem_tensor_like(sBuf[k][s % D, tidx, None])
                     cute.autovec_copy(sBuf[k][s % D, tidx, None], r)
                     regs.append(r)
-                self._compute_store(regs, mOuts, consts, i)
+                self._compute_store(regs, mOuts, consts, i, device)
             # Issue seg s+D into the freed ring slot ((s+D)%D == s%D).
             if const_expr(s + D < ept):
                 ni = base + const_expr(s + D) * block
@@ -339,7 +374,7 @@ class _ElementwiseVec:
                 cute.arch.cp_async_commit_group()
 
     @cute.jit
-    def _kernel_tma(self, mIns, mOuts, consts, nvec, tma_atoms, base, block):
+    def _kernel_tma(self, mIns, mOuts, consts, nvec, tma_atoms, base, block, device):
         # Tile-mode TMA gmem->smem via PipelineTmaAsync (correct mbarrier/phase). One
         # bulk load of the whole (block, V) tile per input (ept==1 for tma), then each
         # thread computes its row from smem. All CuteDSL primitives (make_tiled_tma_atom
@@ -398,7 +433,7 @@ class _ElementwiseVec:
                     r = cute.make_rmem_tensor_like(sBuf[k][r_local, None])
                     cute.autovec_copy(sBuf[k][r_local, None], r)
                     regs.append(r)
-                self._compute_store(regs, mOuts, consts, i)
+                self._compute_store(regs, mOuts, consts, i, device)
         pipe.consumer_release(cs)
 
 
@@ -658,6 +693,17 @@ def _fake_vec(t, V, dyn, index_type=cutlass.Int32):
     )
 
 
+def _view_device_scalar(t):
+    # A 0-d or one-element operand as (1,): every thread reads element 0.
+    return t.reshape(1)
+
+
+def _fake_device_scalar(t):
+    return _L.fake_compact(
+        torch2cute[t.dtype], (1,), stride_order=(0,), align=t.element_size()
+    )
+
+
 def _view_rowvec(t, rows, run, row_step, V):
     # A dense run per row, rows `row_step` apart: the innermost V is a contiguous vector, only the
     # row base carries the gap.
@@ -715,6 +761,7 @@ class _Plan(NamedTuple):
     out_dtypes: tuple  # per-output torch dtype (its length is the output count)
     fn: object  # the compiled kernel
     rowgap: tuple = ()  # (rows, run, row_step) for the rowvec path; () otherwise
+    device: tuple = ()  # per-operand device-scalar mask (vec paths); () otherwise
 
 
 def _index_type(
@@ -753,6 +800,7 @@ def _build_plan(
     pipe_depth,
     out_ref=None,
     with_index=False,
+    device_mask=None,
 ):
     # ALL shape-invariant work for this operand signature: broadcast shape, path
     # selection, op construction, and the kernel compile (against the live tensors as
@@ -801,6 +849,15 @@ def _build_plan(
     # one cp.async, so fall back to direct rather than fail IR verification.
     if load == "cpasync" and V * compute.width > 128:
         load = "direct"
+    # Device scalars leave the operand list only when the rest takes the flat vec path; every
+    # other route keeps them as stride-0 broadcast operands.
+    device = ()
+    if device_mask is not None:
+        rest = [t for t, is_scalar in zip(inputs, device_mask) if not is_scalar]
+        if not with_index and _vec_ok(rest, shape, out_dtypes, compute_torch, V):
+            device = tuple(t for t, is_scalar in zip(inputs, device_mask) if is_scalar)
+            fn = _scalar_operands(fn, device_mask)
+            inputs, nin, ref = rest, len(rest), rest[0]
     dev = ref.device
     # The strided route BAKES its operands' layouts, and for a nullary op the output is the
     # only operand -- so seed with the REAL target rather than a fresh contiguous tensor,
@@ -830,6 +887,7 @@ def _build_plan(
         tuple(out_dtypes),
         in_dtypes,
         with_index,
+        tuple(t.dtype for t in device),
     )
     # An index-consuming fn only works on the strided route (the vectorized routes give the
     # fn a whole V-wide fragment, not one element, so there is no single index to pass), so
@@ -856,8 +914,10 @@ def _build_plan(
             pipe_depth,
             torch2cute[ref.dtype],
             index_type,
+            len(device),
         )
         cin = [_fake_vec(t, V, True, index_type) for t in inputs]
+        cin += [_fake_device_scalar(t) for t in device]
         cout = [_fake_vec(o, V, True, index_type) for o in seed_outs]
         path = "vec"
         kkey = common + ("vec", V, block, ept, load, pipe_depth, index_type)
@@ -876,8 +936,10 @@ def _build_plan(
             pipe_depth,
             torch2cute[ref.dtype],
             index_type,
+            len(device),
         )
         cin = [_fake_vec(t, V, False) for t in inputs]
+        cin += [_fake_device_scalar(t) for t in device]
         cout = [_fake_vec(o, V, False) for o in seed_outs]
         path = "vec_static"
         kkey = common + (
@@ -952,7 +1014,9 @@ def _build_plan(
         lambda: _L.compile_kernel(op, cin, cout, seed_consts, _L.stream()),
         op=op_name,
     )
-    return _Plan(path, shape, V, tuple(out_dtypes), compiled, rowgap)
+    return _Plan(
+        path, shape, V, tuple(out_dtypes), compiled, rowgap, device_mask if device else ()
+    )
 
 
 def run(
@@ -972,6 +1036,7 @@ def run(
     pipe_depth=None,
     out=None,
     with_index=False,
+    device_scalars=False,
 ):
     # inputs: torch tensors (any broadcastable shapes / strides). Returns nout torch
     # tensors of the broadcast shape. The plan (path / shape / compiled kernel) is
@@ -983,22 +1048,20 @@ def run(
     # given, the kernel writes into these instead of allocating (the caller guarantees
     # they are the broadcast shape, right dtype, and contiguous; the override cond gates
     # that). None -> allocate fresh outputs (the functional path).
+    # device_scalars: the caller's opt-in to reading one-element CUDA operands through a
+    # pointer on the vectorized routes (see _device_scalar_mask).
+    device_mask = _device_scalar_mask(inputs, out) if device_scalars else None
     if out is not None and nout == 1 and not with_index:
         from . import tuned
 
         knobs = (block, ept, vec_bits, load, pipe_depth)
         if all(value is None for value in knobs) and tuned.try_run(
-            fn, key, inputs, out[0], consts, compute
+            fn, key, inputs, out[0], consts, compute, device_mask
         ):
             return tuple(out)
     scalar_mask = tuple(t.device.type == "cpu" and t.dim() == 0 for t in inputs)
     if any(scalar_mask):
-        scalar_key = (id(fn), scalar_mask)
-        scalar_fn = _SCALAR_FUNCTIONS.get(scalar_key)
-        if scalar_fn is None:
-            scalar_fn = _ScalarOperands(fn, scalar_mask)
-            _SCALAR_FUNCTIONS[scalar_key] = scalar_fn
-        fn = scalar_fn
+        fn = _scalar_operands(fn, scalar_mask)
         scalar_consts = tuple(
             compute(t.item()) for t, scalar in zip(inputs, scalar_mask) if scalar
         )
@@ -1006,6 +1069,8 @@ def run(
         inputs = tuple(t for t, scalar in zip(inputs, scalar_mask) if not scalar)
         nin = len(inputs)
         key = (*key, scalar_mask)
+    elif device_mask is not None:
+        key = (*key, "device", device_mask)
     plan = cached_plan(
         _PLAN,
         key,
@@ -1031,8 +1096,17 @@ def run(
             # the only source of shape/device/layout. Such a call always passes `out`.
             out[0] if not inputs and out else None,
             with_index,
+            device_mask=device_mask,
         ),
     )
+    device_in = []
+    if plan.device:
+        device_in = [
+            _L.read_only(_view_device_scalar(t))
+            for t, is_scalar in zip(inputs, plan.device)
+            if is_scalar
+        ]
+        inputs = [t for t, is_scalar in zip(inputs, plan.device) if not is_scalar]
     if inputs:
         dev = inputs[0].device
     elif out:
@@ -1046,7 +1120,7 @@ def run(
         else [torch.empty(plan.shape, device=dev, dtype=d) for d in plan.out_dtypes]
     )
     if plan.path in ("vec", "vec_static"):
-        cin = [_L.read_only(_view_vec(t, plan.V)) for t in inputs]
+        cin = [_L.read_only(_view_vec(t, plan.V)) for t in inputs] + device_in
         cout = [_view_vec(o, plan.V) for o in outs]
     elif plan.path == "rowvec":
         rows, run, row_step = plan.rowgap
